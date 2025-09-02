@@ -23,58 +23,54 @@ def merge_shards(it):
         x = np.asarray(x).reshape(-1, *x.shape[2:])  # (ndev*per_dev, ...)
         yield x
 
-def normalize_for_ott(it, dim=1):
-    """
-    Yield batches as (n_dev, per_dev, dim), regardless of incoming layout.
-    - Moves the axis equal to n_dev to the front (device axis).
-    - Moves the axis equal to `dim` to the end (feature axis).
-    - Flattens everything in between into per_dev.
-    """
+import numpy as np, jax, jax.numpy as jnp
+
+def normalize_for_ott(it, dim=1, name=""):
     ndev = jax.local_device_count()
+    step = 0
     for batch in it:
         arr = np.asarray(batch)
 
-        # If 1D: treat as (B,) features, add axes
-        if arr.ndim == 1:
+        # Make 3D: (n_dev, per_dev, dim)
+        if arr.ndim == 1:                   # (B,) → (1,B,1)
             arr = arr.reshape(1, -1, 1)
+        elif arr.ndim == 2:                 # (B,d) → (1,B,d)
+            arr = arr[None, ...]
+        elif arr.ndim > 3:                  # collapse extra tails
+            arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
 
-        # If 2D: could be (B, d) or (d, B)
-        if arr.ndim == 2:
-            # pick feature axis
-            if arr.shape[-1] == dim:
-                arr = arr[None, ...]                  # (1, B, dim)
-            elif arr.shape[0] == dim:
-                arr = np.swapaxes(arr, 0, 1)[None]    # (1, B, dim)
-            else:
-                # assume (B,) — add feature axis
-                arr = arr.reshape(1, arr.shape[0], 1)
+        # Move device axis to front if needed
+        if arr.shape[0] != ndev and ndev in arr.shape:
+            dev_ax = int(list(arr.shape).index(ndev))
+            arr = np.moveaxis(arr, dev_ax, 0)
+        if arr.shape[0] != ndev:            # assume single device
+            arr = arr[None, ...]
 
-        # If 3D+: bring device axis to front, feature axis to end, flatten middle
-        if arr.ndim >= 3:
-            # bring device axis to 0
-            if arr.shape[0] != ndev and ndev in arr.shape:
-                dev_ax = int(list(arr.shape).index(ndev))
-                arr = np.moveaxis(arr, dev_ax, 0)
-            elif arr.shape[0] != ndev and ndev not in arr.shape:
-                # assume single device; add a device axis
-                arr = arr[None, ...]
-            # bring feature axis (size dim) to -1
-            if dim in arr.shape:
-                feat_ax = int(list(arr.shape).index(dim))
-                arr = np.moveaxis(arr, feat_ax, -1)
-            # collapse middle to per_dev
-            if arr.ndim > 3:
-                arr = arr.reshape(arr.shape[0], -1, arr.shape[-1])
+        # Ensure feature last; if some axis equals dim, move it to -1
+        if dim in arr.shape[1:]:
+            feat_ax = (1 + list(arr.shape[1:]).index(dim))
+            arr = np.moveaxis(arr, feat_ax, -1)
 
-        # final shape checks
+        # Final collapse to (n_dev, per_dev, dim)
         if arr.ndim != 3:
-            raise ValueError(f"Expected 3D, got {arr.shape}")
-        if arr.shape[-1] != dim:
-            # last resort: if last dim not dim but there's a singleton, fix it
-            if arr.shape[-1] == 1 and dim == 1:
-                pass
-            else:
-                raise ValueError(f"Feature axis wrong: {arr.shape}, want last dim {dim}")
+            arr = arr.reshape(arr.shape[0], -1, arr.shape[-1])
+
+        # Asserts
+        assert arr.ndim == 3, (name, arr.shape)
+        assert arr.shape[0] == ndev, (name, "ndev", arr.shape, ndev)
+        assert arr.shape[-1] == dim, (name, "dim", arr.shape, dim)
+
+        # Per-device & per-sample sanity
+        a0 = arr[0]
+        assert a0.ndim == 2, (name, "dev slice ndim", a0.shape)
+        assert a0.shape[-1] == dim, (name, "dev slice dim", a0.shape)
+        s0 = a0[0]
+        assert s0.shape == (dim,), (name, "sample shape", s0.shape, dim)
+
+        # Log a few steps so you see the first mismatch when it happens
+        if step < 3 or step % 100 == 0:
+            print(f"{name} step {step}: batch {arr.shape} | dev0 {a0.shape} | sample {s0.shape}")
+        step += 1
 
         yield jnp.asarray(arr)
         
@@ -182,7 +178,7 @@ class JAXDualH5DataLoader:
 
                     data = dataset[batch_idx_sorted]  # (eff_bs, ...)
                     # reshape to (ndev, per_dev, ...)
-                    data = data.reshape(ndev, per_dev, *data.shape[1:])
+                    #data = data.reshape(ndev, per_dev, *data.shape[1:]) #adding this line even for 1 GPU makes the code not run 
                     yield data
                     
         finally:
