@@ -2,6 +2,15 @@ import h5py, numpy as np
 import jax, jax.numpy as jnp
 from flax.jax_utils import prefetch_to_device
 
+
+def as_2d(x):
+    x = jnp.asarray(x)
+    if x.ndim == 1:
+        x = x[:, None]                # (N,) -> (N,1)
+        print(x.shape)
+    return x
+
+
 def fit_quantile_map_S2T(src_train, tgt_train):
     s_sorted = np.sort(src_train.ravel())
     t_sorted = np.sort(tgt_train.ravel())
@@ -16,6 +25,32 @@ def fit_quantile_map_S2T(src_train, tgt_train):
         return t_sorted[idx]
     return T
 
+def empirical_quantile_map(x_grid, src, tgt):
+    # src,tgt: (N,1) arrays; x_grid: (M,1)
+    import numpy as np
+    src = np.asarray(src).ravel()
+    tgt = np.asarray(tgt).ravel()
+    xg  = np.asarray(x_grid).ravel()
+    s_q = np.argsort(src)
+    F_s = np.searchsorted(np.sort(src), xg, side="right") / len(src)
+    qs  = np.clip((F_s * (len(tgt)-1)).astype(int), 0, len(tgt)-1)
+    Tstar = np.sort(tgt)[qs]
+    return Tstar  # shape (M,)
+
+def get_maps(pots):
+    # Try to grab the vmapped gradients in a version-agnostic way
+    if hasattr(pots, "f_grad") and hasattr(pots, "g_grad"):
+        f_grad, g_grad = pots.f_grad, pots.g_grad
+    elif hasattr(pots, "transport"):  # some versions let you pick a direction
+        # wrap to explicit maps
+        f_grad = lambda x: pots.transport(x, forward=True)   # source→target
+        g_grad = None #lambda x: pots.transport(x, forward=False)  # target→source
+    elif hasattr(pots, "transport_source") and hasattr(pots, "transport_target"):
+        f_grad, g_grad = pots.transport_source, pots.transport_target
+    else:
+        raise RuntimeError("Can't find gradient/transport methods on learned_potentials.")
+    return f_grad, g_grad
+    
 def merge_shards(it):
     it = iter(it)
     while True:
@@ -23,7 +58,15 @@ def merge_shards(it):
         x = np.asarray(x).reshape(-1, *x.shape[2:])  # (ndev*per_dev, ...)
         yield x
 
-import numpy as np, jax, jax.numpy as jnp
+
+def normalize(x, mean, std):
+    z = (x - mean) / (std + 1e-6)
+    return jnp.clip(z, -10.0, 10.0).astype(jnp.float32)
+
+def normalized_iter(raw_iter, mean, std):
+    while True:
+        yield normalize(next(raw_iter), mean, std)
+
 
 def normalize_for_ott(it, dim=1, name=""):
     ndev = jax.local_device_count()
@@ -76,7 +119,6 @@ def normalize_for_ott(it, dim=1, name=""):
         
 class JAXDualH5DataLoader:
     """
-    Two-stream, GPU-prefetching DataLoader for JAX using HDF5 files.
 
     Args:
         source_path (str): Path to the source .h5 file.
@@ -105,6 +147,7 @@ class JAXDualH5DataLoader:
         align: bool = True,
         drop_last: bool = True,
         cache_in_mem: bool = True,
+        device_index: int = 0,
     ):
         self.source_path = source_path
         self.target_path = target_path
@@ -117,7 +160,8 @@ class JAXDualH5DataLoader:
         self.align = align
         self.drop_last = drop_last
         self.cache_in_mem = cache_in_mem
-
+        self.device = jax.devices()[device_index]
+        
         self.ndev = jax.local_device_count()
         print(f"Using {self.ndev} devices for prefetching.")
 
@@ -130,6 +174,11 @@ class JAXDualH5DataLoader:
             self.batch_size = new_bs
 
         # Determine dataset sizes
+        with h5py.File(self.source_path, "r") as fs:
+            self.n_source = fs[self.source_key].shape[0]
+        with h5py.File(self.target_path, "r") as ft:
+            self.n_target = ft[self.target_key].shape[0]
+
         with h5py.File(self.source_path, "r") as fs:
             self.n_source = fs[self.source_key].shape[0]
         with h5py.File(self.target_path, "r") as ft:
@@ -148,6 +197,52 @@ class JAXDualH5DataLoader:
         # Add a leading axis so users can opt to vmap/pmap over it if they want
         return arr[None]
 
+    def _data_generator(self, path, key, n_samples, seed, cached, device_arr=None):
+        """Yield batches; if device_arr is set, batches are sliced on GPU."""
+        # If we have a full device-resident array, we never open the file.
+        f = None if (cached is not None or device_arr is not None) else h5py.File(path, "r", swmr=True)
+        try:
+            if device_arr is not None:
+                dataset = device_arr  # jax.Array on GPU
+                dataset_on_device = True
+            else:
+                dataset = cached if cached is not None else f[key]  # np.ndarray or h5py dataset
+                dataset_on_device = False
+    
+            rng = np.random.RandomState(seed)
+            base_idx = np.arange(n_samples)
+    
+            # enforce per-device sharding bookkeeping (you keep this logic)
+            ndev = self.ndev
+            per_dev = max(1, self.batch_size // ndev)
+            eff_bs = per_dev * ndev
+            if eff_bs != self.batch_size:
+                print(f"[JAXDualH5DataLoader] Adjusting batch_size {self.batch_size} -> {eff_bs} for {ndev} devices.")
+                self.batch_size = eff_bs
+    
+            while True:
+                if self.shuffle:
+                    rng.shuffle(base_idx)
+    
+                # drop tail to keep equal shards
+                for start in range(0, n_samples - eff_bs + 1, eff_bs):
+                    batch_idx = base_idx[start : start + eff_bs]
+                    # sorted slicing is faster for HDF5, harmless for device gather
+                    batch_idx_sorted = np.sort(batch_idx)
+    
+                    if dataset_on_device:
+                        # Indices on device; gather stays on device, no H2D copy
+                        idx_dev = jnp.asarray(batch_idx_sorted, dtype=jnp.int32)
+                        data = dataset[idx_dev]     # jax device gather
+                    else:
+                        # Host path: RAM cache or direct HDF5 read
+                        data = dataset[batch_idx_sorted]  # np.ndarray
+                    #print(data.shape)
+                    yield data
+        finally:
+            if f is not None:
+                f.close()
+    '''
     def _data_generator(self, path, key, n_samples, seed, cached):
         """Yield batches as (ndev, per_dev, ...) for prefetch_to_device."""
         # Open the file only if we're not caching to RAM
@@ -184,7 +279,7 @@ class JAXDualH5DataLoader:
         finally:
             if f is not None:
                 f.close()
-
+    '''
     def _load_dataset(self, path, key):
         """Optional RAM cache."""
         if not self.cache_in_mem:
@@ -192,21 +287,37 @@ class JAXDualH5DataLoader:
         with h5py.File(path, "r") as f:
             return f[key][()]  # load entire dataset once
 
+
+
     def _build_iterators(self):
         # prepare caches (or None)
         src_cached = self._load_dataset(self.source_path, self.source_key)
         tgt_cached = self._load_dataset(self.target_path, self.target_key)
-
+    
+        # --- NEW: make persistent device arrays if cached is available ---
+        self.src_dev = None
+        self.tgt_dev = None
+        if src_cached is not None:
+            # move once to GPU
+            print("moving source to GPU")
+            self.src_dev = jax.device_put(jnp.asarray(src_cached), device=self.device)
+        if tgt_cached is not None:
+            print("moving target to GPU")
+            self.tgt_dev = jax.device_put(jnp.asarray(tgt_cached), device=self.device)
+    
         # raw infinite generators
         source_gen = self._data_generator(
-            self.source_path, self.source_key, self.n_source, seed=self.seed, cached=src_cached
+            self.source_path, self.source_key, self.n_source, seed=self.seed,
+            cached=src_cached, device_arr=self.src_dev      # <- pass device array
         )
         target_gen = self._data_generator(
-            self.target_path, self.target_key, self.n_target, seed=self.seed + 1, cached=tgt_cached
+            self.target_path, self.target_key, self.n_target, seed=self.seed + 1,
+            cached=tgt_cached, device_arr=self.tgt_dev      # <- pass device array
         )
-
+    
         self.source_iter = source_gen
         self.target_iter = target_gen
+        
     def __iter__(self):
         if not self.align:
             # If not aligning, iterate source by default
